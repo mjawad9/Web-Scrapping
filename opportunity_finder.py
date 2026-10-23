@@ -1,21 +1,3 @@
-"""
-Opportunity Finder: search jobs, internships and admissions from several sources
-in one place instead of googling each site by hand.
-
-Install:   pip install streamlit requests beautifulsoup4 pandas
-Run:       streamlit run opportunity_finder.py
-
-How it works
-  1. API sources (Remotive, Arbeitnow): stable, legal, no scraping needed.
-  2. Generic scraper: add ANY website in SOURCES below by giving CSS selectors.
-     Right-click a result on the site -> Inspect -> copy the class names.
-  3. Results are merged, de-duplicated, filtered by keyword and can be
-     downloaded as CSV.
-
-Be polite: the scraper checks robots.txt, sends a clear User-Agent and waits
-between requests. Always respect each website's Terms of Service.
-"""
-
 import time
 from urllib.parse import urljoin, urlparse, quote_plus
 from urllib.robotparser import RobotFileParser
@@ -29,12 +11,6 @@ HEADERS = {"User-Agent": "OpportunityFinderBot/1.0 (student project)"}
 TIMEOUT = 15
 DELAY_SECONDS = 1.5  # pause between requests to avoid hammering servers
 
-# ---------------------------------------------------------------------------
-# 1) Config-driven scraping sources. EDIT the selectors to match each site.
-#    {query} in the url is replaced with the search keyword.
-#    The entries below are TEMPLATES: sites change their HTML, so inspect the
-#    page and update "item", "title", "link", etc. before using them.
-# ---------------------------------------------------------------------------
 SOURCES = [
     {
         "name": "Example Job Site",
@@ -61,9 +37,6 @@ SOURCES = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def allowed_by_robots(url: str) -> bool:
     """Return True if robots.txt allows fetching this URL."""
     parts = urlparse(url)
@@ -96,9 +69,7 @@ def make_row(source, category, title, company, location, link, extra=""):
     }
 
 
-# ---------------------------------------------------------------------------
-# 2) API sources (reliable)
-# ---------------------------------------------------------------------------
+
 def fetch_remotive(keyword: str):
     rows = []
     try:
@@ -145,9 +116,7 @@ def fetch_arbeitnow(keyword: str):
     return rows
 
 
-# ---------------------------------------------------------------------------
-# 3) Generic scraper
-# ---------------------------------------------------------------------------
+
 def scrape_source(src: dict, keyword: str):
     rows = []
     url = src["url"].format(query=quote_plus(keyword))
@@ -178,9 +147,7 @@ def scrape_source(src: dict, keyword: str):
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Streamlit UI
-# ---------------------------------------------------------------------------
+
 def main():
     st.set_page_config(page_title="Opportunity Finder", page_icon="🔎", layout="wide")
     st.title("🔎 Opportunity Finder")
