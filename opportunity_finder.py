@@ -6,8 +6,9 @@ Sources (official public APIs / RSS feeds, no scraping of blocked sites)
   - Remote OK         https://remoteok.com          (public API, link back required)
   - We Work Remotely  https://weworkremotely.com    (public RSS feed)
   - The Muse          https://www.themuse.com       (public API, has an Internship level)
-  Plus one-click search links for LinkedIn, Indeed Pakistan and Rozee.pk
-  (these sites do not allow scraping, so the app opens them for you instead).
+  Plus Google search buttons (site: filters) for LinkedIn, Indeed Pakistan, Rozee.pk,
+  Mustakbil and Bayt, and Google Jobs. These sites do not allow scraping, so the app
+  opens Google for you instead.
 
 Install:   pip install streamlit requests beautifulsoup4 pandas
 Run:       streamlit run opportunity_finder.py
@@ -16,7 +17,7 @@ Run:       streamlit run opportunity_finder.py
 import re
 import time
 import xml.etree.ElementTree as ET
-from urllib.parse import quote, quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import pandas as pd
@@ -304,14 +305,45 @@ def scrape_source(src, keyword, location):
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-def direct_links(keyword, location, internship):
-    q = f"{keyword} intern" if internship else keyword
-    loc = location.strip() or "Pakistan"
-    return {
-        "LinkedIn": f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(q)}&location={quote_plus(loc)}",
-        "Indeed Pakistan": f"https://pk.indeed.com/jobs?q={quote_plus(q)}&l={quote_plus(loc)}",
-        "Rozee.pk": f"https://www.rozee.pk/job/jsearch/q/{quote(q)}",
+GOOGLE_SITES = {
+    "LinkedIn": "linkedin.com/jobs",
+    "Indeed Pakistan": "pk.indeed.com",
+    "Rozee.pk": "rozee.pk",
+    "Mustakbil": "mustakbil.com",
+    "Bayt": "bayt.com",
+}
+FRESHNESS = {"Any time": "", "Past 24 hours": "d", "Past week": "w", "Past month": "m"}
+
+
+def google_location_clause(location, include_remote):
+    """Build ("Rawalpindi" OR "Islamabad" OR "Pakistan" OR remote) for a Google query."""
+    parts = [p.strip() for p in re.split(r"[,/|]", location) if p.strip()]
+    names, seen = [], set()
+    for i, p in enumerate(parts):
+        aliases = LOCATION_ALIASES.get(p.lower(), []) if i == 0 else []  # expand only the first place
+        for n in [p] + aliases:
+            if len(n) > 2 and n.lower() not in seen:
+                seen.add(n.lower())
+                names.append(n)
+    names = [f'"{n}"' for n in names[:4]]
+    if include_remote and names:
+        names.append("remote")
+    return f"({' OR '.join(names)})" if names else ""
+
+
+def google_links(keyword, location, internship, include_remote, freshness):
+    """Google searches limited to one job site each, plus Google's own Jobs panel."""
+    role = f'"{keyword}"' + (" (intern OR internship)" if internship else "")
+    loc = google_location_clause(location, include_remote)
+    tbs = f"&tbs=qdr:{FRESHNESS[freshness]}" if FRESHNESS[freshness] else ""
+    base = "https://www.google.com/search?q="
+    links = {
+        "Google Jobs": f"{base}{quote_plus(f'{keyword} {"internship" if internship else "jobs"} {location}'.strip())}&ibp=htl;jobs",
     }
+    for name, site in GOOGLE_SITES.items():
+        query = " ".join(x for x in (f"site:{site}", role, loc) if x)
+        links[name] = f"{base}{quote_plus(query)}{tbs}"
+    return links
 
 
 def main():
@@ -330,6 +362,8 @@ def main():
         include_remote = st.checkbox("Also include remote / worldwide", value=True)
         include_unknown = st.checkbox("Also include listings with no location", value=False)
 
+        freshness = st.selectbox("Google links: posted within", list(FRESHNESS), index=2)
+
         enabled_custom = [s for s in SOURCES if s["enabled"]]
         go = st.button("Search", type="primary", use_container_width=True)
 
@@ -342,11 +376,13 @@ def main():
 
     internship = category == "Internships"
 
-    with st.expander("🔗 Also search directly on these sites", expanded=False):
-        st.caption("These sites do not allow scraping, so they open in a new tab.")
+    with st.expander("🔍 Find exact jobs with Google (sites that don't allow scraping)", expanded=True):
+        st.caption("Each button opens a Google search limited to one job site, using your "
+                   "keyword, location and date filter.")
         cols = st.columns(3)
-        for col, (name, url) in zip(cols, direct_links(keyword, location, internship).items()):
-            col.link_button(name, url, use_container_width=True)
+        links = google_links(keyword, location, internship, include_remote, freshness)
+        for i, (name, url) in enumerate(links.items()):
+            cols[i % 3].link_button(name, url, use_container_width=True)
 
     queries = [keyword]
     loc_terms = expand_location(location)
