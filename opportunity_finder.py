@@ -14,32 +14,14 @@ New in v4
   - Application tracker: save jobs, set status and deadline, add notes,
     download / restore your tracker as CSV. Nothing is stored on the server.
 
-  - Email: saved jobs are emailed to you automatically (or with a button), and the
-    tracker shows an "Emailed" status for each job.
-
-Email setup (Streamlit secrets, never in the code). For Gmail turn on 2-step
-verification, create an "App password", then add:
-    SMTP_USER = "you@gmail.com"
-    SMTP_PASSWORD = "your-16-letter-app-password"
-    # optional
-    SMTP_HOST = "smtp.gmail.com"
-    SMTP_PORT = "587"
-    EMAIL_TO = "you@gmail.com"   # locks all emails to this one address (recommended
-                                 # if the app is public, so nobody can use your
-                                 # account to email other people)
-
 Install:   pip install -r requirements.txt
 Run:       streamlit run opportunity_finder.py
 """
 
 import html
-import os
 import re
-import smtplib
-import ssl
 import time
 import xml.etree.ElementTree as ET
-from email.message import EmailMessage
 from urllib.parse import quote_plus, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -107,11 +89,8 @@ intern internship junior senior job jobs role team work working remote full time
 engineer developer manager specialist associate lead""".split())
 
 STATUSES = ["Saved", "Applied", "Interview", "Offer", "Rejected"]
-TRACK_COLS = ["Title", "Organization", "Status", "Emailed", "Deadline", "Notes",
+TRACK_COLS = ["Title", "Organization", "Status", "Deadline", "Notes",
               "Location", "Source", "Match %", "Link"]
-MAX_JOBS_PER_EMAIL = 50
-MAX_EMAILS_PER_SESSION = 5      # when the recipient is not locked with EMAIL_TO
-MAX_EMAILS_LOCKED = 50
 
 
 # ---------------------------------------------------------------------------
@@ -483,113 +462,6 @@ def show_flash():
 
 
 # ---------------------------------------------------------------------------
-# Email
-# ---------------------------------------------------------------------------
-def get_secret(name, default=""):
-    try:
-        if name in st.secrets:
-            return str(st.secrets[name])
-    except Exception:
-        pass
-    return os.environ.get(name, default)
-
-
-def smtp_ready():
-    return bool(get_secret("SMTP_USER") and get_secret("SMTP_PASSWORD"))
-
-
-def valid_email(addr):
-    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", (addr or "").strip()))
-
-
-def recipient():
-    locked = get_secret("EMAIL_TO").strip()
-    return locked or (st.session_state.get("email_to_input") or "").strip()
-
-
-def build_email(to, jobs):
-    """Return an EmailMessage (plain text + HTML) listing the given tracker rows."""
-    sender = get_secret("SMTP_USER")
-    n = len(jobs)
-    msg = EmailMessage()
-    msg["Subject"] = f"Opportunity Finder: {n} saved job{'s' if n != 1 else ''}"
-    msg["From"] = f"Opportunity Finder <{sender}>"
-    msg["To"] = to
-
-    text_lines, html_rows = [], []
-    for i, (_, r) in enumerate(jobs.iterrows(), 1):
-        deadline = r["Deadline"].strftime("%d %b %Y") if pd.notna(r["Deadline"]) else "-"
-        match = f"{int(r['Match %'])}%" if pd.notna(r["Match %"]) else "-"
-        link = str(r["Link"] or "")
-        link = link if link.startswith(("http://", "https://")) else ""
-        text_lines.append(
-            f"{i}. {r['Title']} - {r['Organization']} ({r['Location']})\n"
-            f"   Status: {r['Status']} | Deadline: {deadline} | Match: {match}\n"
-            f"   {link}\n")
-        a = f'<a href="{html.escape(link)}">Open</a>' if link else "-"
-        html_rows.append(
-            "<tr>" + "".join(f"<td style='padding:6px;border-bottom:1px solid #ddd'>{c}</td>" for c in (
-                html.escape(str(r["Title"])), html.escape(str(r["Organization"] or "")),
-                html.escape(str(r["Location"] or "")), html.escape(str(r["Status"])),
-                deadline, match, a)) + "</tr>")
-    msg.set_content("Your saved jobs:\n\n" + "\n".join(text_lines))
-    msg.add_alternative(
-        "<h3>Your saved jobs</h3><table style='border-collapse:collapse;font-family:sans-serif;font-size:14px'>"
-        "<tr><th align='left'>Title</th><th align='left'>Company</th><th align='left'>Location</th>"
-        "<th align='left'>Status</th><th align='left'>Deadline</th><th align='left'>Match</th>"
-        "<th align='left'>Link</th></tr>" + "".join(html_rows) + "</table>", subtype="html")
-    return msg
-
-
-def send_email(to, jobs):
-    msg = build_email(to, jobs)
-    host = get_secret("SMTP_HOST", "smtp.gmail.com")
-    port = int(get_secret("SMTP_PORT", "587"))
-    user, pw = get_secret("SMTP_USER"), get_secret("SMTP_PASSWORD")
-    ctx = ssl.create_default_context()
-    if port == 465:
-        with smtplib.SMTP_SSL(host, port, context=ctx, timeout=20) as s:
-            s.login(user, pw)
-            s.send_message(msg)
-    else:
-        with smtplib.SMTP(host, port, timeout=20) as s:
-            s.starttls(context=ctx)
-            s.login(user, pw)
-            s.send_message(msg)
-
-
-def email_rows(indices, auto=False):
-    """Email tracker rows (by position) and record the result in the Emailed column."""
-    if not len(indices):
-        return
-    to = recipient()
-    if not smtp_ready() or not valid_email(to):
-        if not auto:  # automatic emails stay quiet; the rows remain "not emailed"
-            if not smtp_ready():
-                flash("warning", "Email is not set up yet. Add SMTP_USER and SMTP_PASSWORD to the app secrets.")
-            else:
-                flash("warning", "Enter a valid email address under 📧 Email saved jobs in the sidebar.")
-        return
-    limit = MAX_EMAILS_LOCKED if get_secret("EMAIL_TO").strip() else MAX_EMAILS_PER_SESSION
-    if st.session_state.get("emails_sent", 0) >= limit:
-        flash("warning", f"Email limit reached for this session ({limit}). Refresh the page to reset it.")
-        return
-
-    t = st.session_state["tracker"].copy().reset_index(drop=True)
-    rows = t.loc[list(indices)[:MAX_JOBS_PER_EMAIL]]
-    try:
-        send_email(to, rows)
-        t.loc[rows.index, "Emailed"] = "✅ Emailed"
-        st.session_state["emails_sent"] = st.session_state.get("emails_sent", 0) + 1
-        flash("success", f"📧 Emailed {len(rows)} job(s) to {to}.")
-    except Exception as e:
-        t.loc[rows.index, "Emailed"] = "❌ Failed"
-        flash("error", f"Could not send the email: {e}")
-    st.session_state["tracker"] = t
-    st.session_state["tracker_ver"] += 1
-
-
-# ---------------------------------------------------------------------------
 # Tracker (kept in your browser session, never on the server)
 # ---------------------------------------------------------------------------
 def empty_tracker():
@@ -607,7 +479,7 @@ def add_to_tracker(rows):
             continue
         new.append({
             "Title": r["Title"], "Organization": r["Organization"], "Status": "Saved",
-            "Emailed": "", "Deadline": pd.NaT, "Notes": "", "Location": r["Location"], "Source": r["Source"],
+            "Deadline": pd.NaT, "Notes": "", "Location": r["Location"], "Source": r["Source"],
             "Match %": r.get("Match %"), "Link": r["Link"],
         })
     start = len(t)
@@ -634,7 +506,6 @@ def apply_tracker_edits(key):
     for row in state.get("added_rows", []):
         new = {c: None for c in TRACK_COLS}
         new["Status"] = "Saved"
-        new["Emailed"] = ""
         new.update(row)
         added.append(new)
     if added:
@@ -647,7 +518,6 @@ def apply_tracker_edits(key):
 def render_tracker():
     t = st.session_state["tracker"].copy()
     t["Deadline"] = pd.to_datetime(t["Deadline"], errors="coerce")
-    t["Emailed"] = t["Emailed"].fillna("")
     st.subheader("📋 My applications")
     st.caption("Saved only in this browser session. Download the CSV to keep it, "
                "and restore it below next time.")
@@ -669,11 +539,10 @@ def render_tracker():
         st.data_editor(
             t[TRACK_COLS], key=key, num_rows="dynamic", hide_index=True,
             use_container_width=True, on_change=apply_tracker_edits, args=(key,),
-            disabled=["Emailed", "Source", "Match %", "Link"],
+            disabled=["Source", "Match %", "Link"],
             column_config={
                 "Status": st.column_config.SelectboxColumn("Status", options=STATUSES, required=True),
                 "Deadline": st.column_config.DateColumn("Deadline", format="DD MMM YYYY"),
-                "Emailed": st.column_config.TextColumn("Emailed"),
                 "Link": st.column_config.LinkColumn("Link", display_text="Open"),
                 "Match %": st.column_config.NumberColumn("Match %", format="%d%%"),
             },
@@ -681,17 +550,6 @@ def render_tracker():
         counts = t["Status"].value_counts()
         st.caption(" · ".join(f"{s}: {int(counts.get(s, 0))}" for s in STATUSES))
 
-        done = t["Emailed"].str.startswith("✅")
-        pending = list(t.index[~done])
-        b1, b2, b3 = st.columns([1, 1, 2])
-        if b1.button(f"📧 Email {len(pending)} not yet emailed", disabled=not pending):
-            email_rows(pending)
-            st.rerun()
-        if b2.button("📧 Email all"):
-            email_rows(list(t.index))
-            st.rerun()
-        b3.caption(f"Emailed: {int(done.sum())} of {len(t)}"
-                   + ("" if smtp_ready() else " · email not set up (see sidebar)"))
         st.download_button("⬇️ Download tracker (CSV)", t[TRACK_COLS].to_csv(index=False).encode("utf-8"),
                            file_name="my_applications.csv", mime="text/csv")
 
@@ -707,7 +565,6 @@ def render_tracker():
                 df = df[TRACK_COLS]
                 df["Deadline"] = pd.to_datetime(df["Deadline"], errors="coerce")
                 df["Notes"] = df["Notes"].fillna("")
-                df["Emailed"] = df["Emailed"].fillna("")
                 st.session_state["tracker"] = df
                 st.session_state["tracker_ver"] += 1
                 st.session_state["tracker_loaded"] = sig
@@ -807,8 +664,6 @@ def render_results(cv_text, extra_skills):
                 flash("info", "Those jobs are already in your tracker.")
             else:
                 flash("success", f"Added {len(new_idx)} job(s) to your tracker.")
-                if st.session_state.get("auto_email", True):
-                    email_rows(new_idx, auto=True)
         st.rerun()
     c2.download_button("⬇️ Download results (CSV)",
                        df.drop(columns=["Text"]).to_csv(index=False).encode("utf-8"),
@@ -836,7 +691,7 @@ def main():
         st.header("Search")
         keyword = st.text_input("Keyword", placeholder="e.g. machine learning")
         category = st.selectbox("Type", ["Jobs", "Internships"])
-        chosen = st.multiselect("Job sources", list(API_SOURCES), default=list(API_SOURCES))
+        chosen = list(API_SOURCES)  # all sources are always searched
 
         st.subheader("Location")
         location = st.text_input("Where?", placeholder="e.g. Rawalpindi, Pakistan")
@@ -851,16 +706,6 @@ def main():
             cv_paste = st.text_area("...or paste your CV text", height=120)
             extra_skills = st.text_input("Extra skills to look for", placeholder="comma separated")
             st.caption("Your CV is read in memory for this session only and is not saved.")
-
-        with st.expander("📧 Email saved jobs"):
-            if get_secret("EMAIL_TO").strip():
-                st.caption("Emails are sent to the address set by the app owner.")
-            else:
-                st.text_input("Send to", key="email_to_input", placeholder="you@example.com")
-            st.checkbox("Email automatically when I add jobs to the tracker",
-                        value=True, key="auto_email")
-            if not smtp_ready():
-                st.caption("⚠️ Email is not set up yet (SMTP_USER / SMTP_PASSWORD secrets missing).")
 
         enabled_custom = [s for s in SOURCES if s["enabled"]]
         go = st.button("Search", type="primary", use_container_width=True)
