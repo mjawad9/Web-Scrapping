@@ -15,7 +15,7 @@ Groq key (never hard-code it in the file or upload it to GitHub). Use ONE of:
   - environment variable:   set GROQ_API_KEY=gsk_...        (Windows)
                             export GROQ_API_KEY=gsk_...     (Linux/Mac)
   - .streamlit/secrets.toml:  GROQ_API_KEY = "gsk_..."
-  - paste it into the sidebar box while the app is running
+  - paste it into the sidebar box (shown only when no key is found above)
 """
 
 import json
@@ -35,7 +35,8 @@ TIMEOUT = 15
 DELAY_SECONDS = 1.5
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODEL = "llama-3.3-70b-versatile"  # change in the sidebar if Groq retires it
+MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]  # current Groq production models
+DEFAULT_MODEL = MODELS[0]
 
 REMOTE_WORDS = ("remote", "worldwide", "anywhere", "global", "work from home", "wfh")
 
@@ -88,20 +89,25 @@ def get_groq_key(sidebar_value: str) -> str:
 
 
 def groq_json(api_key, model, system, user):
-    """Call Groq and return the parsed JSON object (raises on failure)."""
+    """Call Groq and return the parsed JSON object (raises with Groq's message on failure)."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+        "temperature": 0.2,
+        "max_completion_tokens": 2048,
+        "response_format": {"type": "json_object"},
+    }
+    if "gpt-oss" in model:
+        payload["reasoning_effort"] = "low"  # faster, cheaper answers
     r = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}],
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-        },
+        json=payload,
         timeout=40,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
     return json.loads(r.json()["choices"][0]["message"]["content"])
 
 
@@ -165,7 +171,7 @@ def expand_location(location, ai_terms=None):
     loc = location.strip().lower()
     if not loc:
         return []
-    terms = {loc}
+    terms = set() if "," in loc else {loc}
     for part in re.split(r"[,/|]", loc):
         part = part.strip()
         if part:
@@ -313,10 +319,13 @@ def main():
         include_unknown = st.checkbox("Also include listings with no location", value=False)
 
         st.subheader("Groq AI (optional)")
-        key_input = st.text_input("Groq API key", type="password",
-                                  help="Or set GROQ_API_KEY as env variable / Streamlit secret.")
-        model = st.text_input("Model", value=DEFAULT_MODEL)
-        api_key = get_groq_key(key_input)
+        api_key = get_groq_key("")  # secrets / environment variable
+        if api_key:
+            st.caption("✅ Groq key loaded from secrets")
+        else:
+            api_key = get_groq_key(st.text_input("Groq API key", type="password"))
+        with st.expander("Advanced"):
+            model = st.selectbox("Groq model", MODELS)
         use_ai = st.checkbox("Use AI", value=bool(api_key), disabled=not api_key)
         ai_keywords = st.checkbox("Expand keyword with AI", value=True, disabled=not use_ai)
         ai_location = st.checkbox("Expand location with AI", value=True, disabled=not use_ai)
