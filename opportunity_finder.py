@@ -9,19 +9,10 @@ Sources (official public APIs / RSS feeds, no scraping of blocked sites)
   Plus one-click search links for LinkedIn, Indeed Pakistan and Rozee.pk
   (these sites do not allow scraping, so the app opens them for you instead).
 
-Optional Groq AI: expands your keyword and location, and ranks results by fit.
-
 Install:   pip install streamlit requests beautifulsoup4 pandas
 Run:       streamlit run opportunity_finder.py
-
-Groq key (never hard-code it or upload it to GitHub). Use ONE of:
-  - Streamlit secrets / .streamlit/secrets.toml:  GROQ_API_KEY = "gsk_..."
-  - environment variable GROQ_API_KEY
-  - the sidebar box (shown only when no key is found above)
 """
 
-import json
-import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -36,9 +27,6 @@ from bs4 import BeautifulSoup
 HEADERS = {"User-Agent": "OpportunityFinderBot/3.0 (student project)"}
 TIMEOUT = 15
 DELAY_SECONDS = 1.5
-
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]  # current Groq production models
 
 REMOTE_WORDS = ("remote", "worldwide", "anywhere", "global", "work from home", "wfh")
 
@@ -73,97 +61,9 @@ SOURCES = [
 
 
 # ---------------------------------------------------------------------------
-# Groq helpers
-# ---------------------------------------------------------------------------
-def get_groq_key(sidebar_value: str) -> str:
-    if sidebar_value.strip():
-        return sidebar_value.strip()
-    try:
-        if "GROQ_API_KEY" in st.secrets:
-            return st.secrets["GROQ_API_KEY"]
-    except Exception:
-        pass
-    return os.environ.get("GROQ_API_KEY", "")
-
-
-def groq_json(api_key, model, system, user):
-    """Call Groq and return the parsed JSON object (raises with Groq's message on failure)."""
-    payload = {
-        "model": model,
-        "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": user}],
-        "temperature": 0.2,
-        "max_completion_tokens": 2048,
-        "response_format": {"type": "json_object"},
-    }
-    if "gpt-oss" in model:
-        payload["reasoning_effort"] = "low"
-    r = requests.post(
-        GROQ_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload, timeout=40,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-    return json.loads(r.json()["choices"][0]["message"]["content"])
-
-
-def ai_expand_keywords(api_key, model, keyword, category):
-    try:
-        data = groq_json(
-            api_key, model,
-            'You help students search for opportunities. Reply ONLY with JSON: '
-            '{"keywords": ["..."]} containing up to 3 short alternative search '
-            'phrases (synonyms or closely related roles).',
-            f"Category: {category}\nKeyword: {keyword}",
-        )
-        return [k.strip() for k in data.get("keywords", []) if isinstance(k, str)][:3]
-    except Exception as e:
-        st.warning(f"Groq keyword expansion failed: {e}")
-        return []
-
-
-def ai_expand_location(api_key, model, location):
-    try:
-        data = groq_json(
-            api_key, model,
-            'Reply ONLY with JSON: {"terms": ["..."]}. List up to 8 lowercase place '
-            "names that a job or internship listing might use for the given location: "
-            "the place itself, its metro area/nearby cities, its province/state and its country.",
-            f"Location: {location}",
-        )
-        return [t.strip().lower() for t in data.get("terms", []) if isinstance(t, str)]
-    except Exception as e:
-        st.warning(f"Groq location expansion failed: {e}")
-        return []
-
-
-def ai_rank(api_key, model, df, profile, category, keyword):
-    """Score rows of df from 0-10 for fit with the user's profile."""
-    items = [
-        {"i": int(i), "title": r.Title, "org": r.Organization, "location": r.Location}
-        for i, r in df.iterrows()
-    ]
-    try:
-        data = groq_json(
-            api_key, model,
-            'Reply ONLY with JSON: {"results": [{"i": 0, "score": 0-10, "reason": "max 12 words"}]}. '
-            "Score how well each listing fits the person's profile and search.",
-            f"Category: {category}\nSearch: {keyword}\nProfile: {profile or 'not given'}\n"
-            f"Listings: {json.dumps(items)}",
-        )
-        scores = {int(x["i"]): x for x in data.get("results", []) if "i" in x}
-        df["AI Score"] = [scores.get(int(i), {}).get("score") for i in df.index]
-        df["Why"] = [scores.get(int(i), {}).get("reason", "") for i in df.index]
-    except Exception as e:
-        st.warning(f"Groq ranking failed: {e}")
-    return df
-
-
-# ---------------------------------------------------------------------------
 # Location logic
 # ---------------------------------------------------------------------------
-def expand_location(location, ai_terms=None):
+def expand_location(location):
     """Turn what the user typed into a list of lowercase search terms."""
     loc = location.strip().lower()
     if not loc:
@@ -174,7 +74,6 @@ def expand_location(location, ai_terms=None):
         if part:
             terms.add(part)
             terms.update(LOCATION_ALIASES.get(part, []))
-    terms.update(ai_terms or [])
     return sorted(terms)
 
 
@@ -418,7 +317,7 @@ def direct_links(keyword, location, internship):
 def main():
     st.set_page_config(page_title="Opportunity Finder", page_icon="🔎", layout="wide")
     st.title("🔎 Opportunity Finder")
-    st.caption("Jobs and internships from multiple sources, with optional Groq AI.")
+    st.caption("Jobs and internships from multiple sources.")
 
     with st.sidebar:
         st.header("Search")
@@ -430,23 +329,6 @@ def main():
         location = st.text_input("Where?", placeholder="e.g. Rawalpindi, Pakistan")
         include_remote = st.checkbox("Also include remote / worldwide", value=True)
         include_unknown = st.checkbox("Also include listings with no location", value=False)
-
-        st.subheader("Groq AI (optional)")
-        api_key = get_groq_key("")
-        if api_key:
-            st.caption("✅ Groq key loaded from secrets")
-        else:
-            api_key = get_groq_key(st.text_input("Groq API key", type="password"))
-        with st.expander("Advanced"):
-            model = st.selectbox("Groq model", MODELS)
-        use_ai = st.checkbox("Use AI", value=bool(api_key), disabled=not api_key)
-        ai_keywords = st.checkbox("Expand keyword with AI", value=True, disabled=not use_ai)
-        ai_location = st.checkbox("Expand location with AI", value=True, disabled=not use_ai)
-        ai_sort = st.checkbox("Rank results by fit", value=True, disabled=not use_ai)
-        profile = st.text_area("Your profile / interests (for ranking)", height=100,
-                               placeholder="e.g. Computer engineering graduate, Python, ML, "
-                                           "looking for AI internships",
-                               disabled=not use_ai)
 
         enabled_custom = [s for s in SOURCES if s["enabled"]]
         go = st.button("Search", type="primary", use_container_width=True)
@@ -467,12 +349,7 @@ def main():
             col.link_button(name, url, use_container_width=True)
 
     queries = [keyword]
-    if use_ai and ai_keywords:
-        queries += ai_expand_keywords(api_key, model, keyword, category)
-    queries = list(dict.fromkeys(queries))
-
-    extra_terms = ai_expand_location(api_key, model, location) if (use_ai and ai_location and location.strip()) else []
-    loc_terms = expand_location(location, extra_terms)
+    loc_terms = expand_location(location)
 
     rows = []
     with st.spinner("Searching sources..."):
@@ -493,20 +370,10 @@ def main():
     if loc_terms:
         st.caption(f"Location terms used: {', '.join(loc_terms)} · "
                    f"{len(df)} of {total} results match")
-    if queries[1:]:
-        st.caption(f"Keywords searched: {', '.join(queries)}")
-
     if df.empty:
         st.warning("Nothing matched this location. Try a country name, tick "
                    "'include remote', or tick 'include listings with no location'.")
         return
-
-    if use_ai and ai_sort:
-        with st.spinner("Ranking with Groq..."):
-            top = ai_rank(api_key, model, df.head(30).copy(), profile, category, keyword)
-            df = pd.concat([top, df.iloc[30:]], ignore_index=True)
-            if "AI Score" in df.columns:
-                df = df.sort_values("AI Score", ascending=False, na_position="last")
 
     st.success(f"Found {len(df)} results")
     st.dataframe(df, use_container_width=True, hide_index=True,
