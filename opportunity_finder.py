@@ -163,10 +163,12 @@ def clean_html(text, limit=3000):
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
-def make_row(source, category, title, company, location, link, extra="", remote=False, text=""):
+def make_row(source, category, title, company, location, link, extra="", remote=False, text="",
+             work=None):
     return {
         "Category": category, "Title": title, "Organization": company,
-        "Location": location, "Remote": remote, "Details": extra,
+        "Location": location, "Remote": remote,
+        "Work type": work or ("Remote" if remote else "On-site"), "Details": extra,
         "Link": link, "Source": source, "Text": clean_html(text),
     }
 
@@ -203,7 +205,7 @@ def fetch_jobicy(keyword, internship=False):
             rows.append(make_row(
                 "Jobicy", "Internships" if internship else "Jobs", title,
                 j.get("companyName", ""), geo, j.get("url", ""),
-                as_text(j.get("jobType")), remote=is_remote(geo), text=body))
+                as_text(j.get("jobType")), remote=is_remote(geo), text=body, work="Remote"))
     except Exception as e:
         st.warning(f"Jobicy failed: {e}")
     return rows
@@ -229,7 +231,7 @@ def fetch_remoteok(keyword, internship=False):
                     "Remote OK", "Internships" if internship else "Jobs",
                     j.get("position", ""), j.get("company", ""), loc,
                     j.get("url", ""), as_text(j.get("tags")), remote=is_remote(loc),
-                    text=f"{as_text(j.get('tags'))} {j.get('description','')}"))
+                    text=f"{as_text(j.get('tags'))} {j.get('description','')}", work="Remote"))
     except Exception as e:
         st.warning(f"Remote OK failed: {e}")
     return rows
@@ -269,7 +271,8 @@ def fetch_wwr(keyword, internship=False):
                 loc = it["region"] or "Remote"
                 rows.append(make_row(
                     "We Work Remotely", "Internships" if internship else "Jobs",
-                    role, company, loc, it["link"], remote=is_remote(loc), text=it["desc"]))
+                    role, company, loc, it["link"], remote=is_remote(loc), text=it["desc"],
+                    work="Remote"))
         except Exception as e:
             st.warning(f"We Work Remotely feed failed: {e}")
     return rows
@@ -302,7 +305,8 @@ def fetch_muse(keyword, internship=False):
                     j.get("name", ""), (j.get("company") or {}).get("name", ""),
                     loc, (j.get("refs") or {}).get("landing_page", ""),
                     ", ".join(l.get("name", "") for l in j.get("levels", [])),
-                    remote=is_remote(loc), text=j.get("contents", "")))
+                    remote=is_remote(loc), text=j.get("contents", ""),
+                    work="Remote" if (is_remote(loc) or "flexible" in loc.lower()) else "On-site"))
     except Exception as e:
         st.warning(f"The Muse failed: {e}")
     return rows
@@ -314,6 +318,8 @@ API_SOURCES = {
     "We Work Remotely": fetch_wwr,
     "The Muse": fetch_muse,
 }
+REMOTE_ONLY_SOURCES = {"Jobicy", "Remote OK", "We Work Remotely"}  # The Muse lists both
+WORK_MODES = ["Remote + on-site", "Remote only", "On-site only"]
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +382,7 @@ GOOGLE_SITES = {
 FRESHNESS = {"Any time": "", "Past 24 hours": "d", "Past week": "w", "Past month": "m"}
 
 
-def google_location_clause(location, include_remote):
+def google_location_clause(location, work_mode):
     """Build ("Rawalpindi" OR "Islamabad" OR "Pakistan" OR remote) for a Google query."""
     parts = [p.strip() for p in re.split(r"[,/|]", location) if p.strip()]
     names, seen = [], set()
@@ -387,19 +393,26 @@ def google_location_clause(location, include_remote):
                 seen.add(n.lower())
                 names.append(n)
     names = [f'"{n}"' for n in names[:4]]
-    if include_remote and names:
+    if work_mode == "Remote + on-site" and names:
         names.append("remote")
+    elif work_mode == "Remote only":
+        names += ["anywhere", "worldwide"]
     return f"({' OR '.join(names)})" if names else ""
 
 
-def google_links(keyword, location, internship, include_remote, freshness):
+def google_links(keyword, location, internship, work_mode, freshness):
     """Google searches limited to one job site each, plus Google's own Jobs panel."""
     role = f'"{keyword}"' + (" (intern OR internship)" if internship else "")
-    loc = google_location_clause(location, include_remote)
+    if work_mode == "Remote only":
+        role += " remote"
+    elif work_mode == "On-site only":
+        role += " -remote"
+    loc = google_location_clause(location, work_mode)
     tbs = f"&tbs=qdr:{FRESHNESS[freshness]}" if FRESHNESS[freshness] else ""
     base = "https://www.google.com/search?q="
     word = "internship" if internship else "jobs"
-    jobs_query = f"{keyword} {word} {location}".strip()
+    mode_word = {"Remote only": " remote", "On-site only": " -remote"}.get(work_mode, "")
+    jobs_query = f"{keyword} {word} {location}{mode_word}".strip()
     links = {"Google Jobs": f"{base}{quote_plus(jobs_query)}&ibp=htl;jobs"}
     for name, site in GOOGLE_SITES.items():
         query = " ".join(x for x in (f"site:{site}", role, loc) if x)
@@ -712,6 +725,8 @@ def run_search(p):
     rows = []
     with st.spinner("Searching sources..."):
         for name in p["chosen"]:
+            if p["work_mode"] == "On-site only" and name in REMOTE_ONLY_SOURCES:
+                continue  # these boards only list remote jobs
             rows += API_SOURCES[name](keyword, internship)
         for src in p["custom"]:
             rows += scrape_source(src, f"{keyword} intern" if internship else keyword, p["location"])
@@ -722,7 +737,12 @@ def run_search(p):
         return
     df = pd.DataFrame(rows).drop_duplicates(subset=["Title", "Organization", "Link"])
     total = len(df)
-    df = apply_location_filter(df, loc_terms, p["include_remote"], p["include_unknown"]).reset_index(drop=True)
+    df = apply_location_filter(df, loc_terms, p["include_remote"], p["include_unknown"])
+    if p["work_mode"] == "Remote only":
+        df = df[df["Work type"] == "Remote"]
+    elif p["work_mode"] == "On-site only":
+        df = df[df["Work type"] == "On-site"]
+    df = df.reset_index(drop=True)
     st.session_state["results"] = {"query": p, "df": df, "total": total, "terms": loc_terms}
 
 
@@ -738,23 +758,25 @@ def render_results(cv_text, extra_skills):
         st.caption("Each button opens a Google search limited to one job site, using your "
                    "keyword, location and date filter.")
         cols = st.columns(3)
-        links = google_links(p["keyword"], p["location"], internship, p["include_remote"], p["freshness"])
+        links = google_links(p["keyword"], p["location"], internship, p["work_mode"], p["freshness"])
         for i, (name, url) in enumerate(links.items()):
             cols[i % 3].link_button(name, url, use_container_width=True)
 
     if df.empty:
         if res["total"]:
-            st.warning("Nothing matched this location. Try a country name, tick "
-                       "'include remote', or tick 'include listings with no location'.")
+            st.warning("Nothing matched this location and work type. Try a country name, "
+                       "tick 'include listings with no location', or switch the work type.")
         else:
-            st.warning("No results from the job sources. Try another keyword, or use the Google buttons above.")
+            st.warning("No results from the job sources. Try another keyword, or use the Google buttons above."
+                       + (" Only The Muse lists on-site jobs here, so the Google buttons are best for local roles."
+                          if p["work_mode"] == "On-site only" else ""))
         return
 
     if res["terms"]:
         st.caption(f"Location terms used: {', '.join(res['terms'])} · "
                    f"{len(df)} of {res['total']} results match")
 
-    cols_show = ["Save", "Title", "Organization", "Location", "Remote", "Source", "Link"]
+    cols_show = ["Save", "Title", "Organization", "Location", "Work type", "Source", "Link"]
     if cv_text.strip():
         df, cv_skills = add_cv_match(df, cv_text, extra_skills)
         cols_show = ["Save", "Match %", "Matched skills"] + cols_show[1:]
@@ -818,7 +840,9 @@ def main():
 
         st.subheader("Location")
         location = st.text_input("Where?", placeholder="e.g. Rawalpindi, Pakistan")
-        include_remote = st.checkbox("Also include remote / worldwide", value=True)
+        work_mode = st.radio("Work type", WORK_MODES, horizontal=False,
+                             help="Jobicy, Remote OK and We Work Remotely list remote jobs only. "
+                                  "The Muse lists both remote and on-site jobs.")
         include_unknown = st.checkbox("Also include listings with no location", value=False)
         freshness = st.selectbox("Google links: posted within", list(FRESHNESS), index=2)
 
@@ -859,7 +883,8 @@ def main():
             else:
                 run_search({
                     "keyword": keyword.strip(), "category": category, "chosen": chosen,
-                    "location": location, "include_remote": include_remote,
+                    "location": location, "work_mode": work_mode,
+                    "include_remote": work_mode != "On-site only",
                     "include_unknown": include_unknown, "freshness": freshness,
                     "custom": enabled_custom,
                 })
