@@ -1,19 +1,24 @@
 """
-Opportunity Finder v3: jobs and internships in one search.
+Opportunity Finder v4: jobs and internships in one search, with CV matching
+and an application tracker.
 
-Sources (official public APIs / RSS feeds, no scraping of blocked sites)
-  - Jobicy            https://jobicy.com            (public API)
-  - Remote OK         https://remoteok.com          (public API, link back required)
-  - We Work Remotely  https://weworkremotely.com    (public RSS feed)
-  - The Muse          https://www.themuse.com       (public API, has an Internship level)
-  Plus Google search buttons (site: filters) for LinkedIn, Indeed Pakistan, Rozee.pk,
-  Mustakbil and Bayt, and Google Jobs. These sites do not allow scraping, so the app
-  opens Google for you instead.
+Search sources (official public APIs / RSS feeds)
+  - Jobicy, Remote OK, We Work Remotely, The Muse
+  - Google buttons (site: filters) for LinkedIn, Indeed Pakistan, Rozee.pk,
+    Mustakbil and Bayt, plus Google Jobs. Those sites do not allow scraping,
+    so the app opens Google for you instead.
 
-Install:   pip install streamlit requests beautifulsoup4 pandas
+New in v4
+  - CV matching: upload or paste your CV and every result gets a Match %
+    and the list of skills you share with the listing (runs locally, no AI key).
+  - Application tracker: save jobs, set status and deadline, add notes,
+    download / restore your tracker as CSV. Nothing is stored on the server.
+
+Install:   pip install -r requirements.txt
 Run:       streamlit run opportunity_finder.py
 """
 
+import html
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -25,7 +30,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-HEADERS = {"User-Agent": "OpportunityFinderBot/3.0 (student project)"}
+HEADERS = {"User-Agent": "OpportunityFinderBot/4.0 (student project)"}
 TIMEOUT = 15
 DELAY_SECONDS = 1.5
 
@@ -59,6 +64,33 @@ SOURCES = [
         "company": "span.company", "location": "span.location",
     },
 ]
+
+# ---------------------------------------------------------------------------
+# Skills used for CV matching. Add your own in the sidebar or extend this list.
+# ---------------------------------------------------------------------------
+SKILLS = [
+    "python", "java", "javascript", "typescript", "c++", "c#", "matlab", "verilog", "vhdl",
+    "sql", "mysql", "postgresql", "mongodb", "html", "css", "react", "node.js", "php",
+    "django", "flask", "fastapi", "streamlit", "git", "github", "docker", "kubernetes",
+    "linux", "aws", "azure", "gcp", "rest api", "api", "ci/cd",
+    "machine learning", "deep learning", "data science", "data analysis", "data analytics",
+    "data engineering", "nlp", "natural language processing", "computer vision", "ai",
+    "artificial intelligence", "llm", "langchain", "crewai", "rag", "generative ai",
+    "tensorflow", "pytorch", "keras", "scikit-learn", "pandas", "numpy", "opencv",
+    "power bi", "tableau", "excel", "statistics", "big data", "spark", "hadoop",
+    "fpga", "vivado", "embedded", "arduino", "raspberry pi", "iot", "robotics", "ros",
+    "unity", "unreal engine", "game development", "web development", "frontend",
+    "backend", "full stack", "android", "ios", "flutter", "ui/ux", "figma",
+    "cybersecurity", "networking", "devops", "agile", "scrum", "testing", "qa",
+    "project management", "communication", "research", "technical writing",
+]
+STOPWORDS = set("""the and for with you your our are will have this that from into out
+intern internship junior senior job jobs role team work working remote full time part
+engineer developer manager specialist associate lead""".split())
+
+STATUSES = ["Saved", "Applied", "Interview", "Offer", "Rejected"]
+TRACK_COLS = ["Title", "Organization", "Status", "Deadline", "Notes",
+              "Location", "Source", "Match %", "Link"]
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +137,16 @@ def apply_location_filter(df, terms, include_remote, include_unknown):
 # ---------------------------------------------------------------------------
 # Job sources
 # ---------------------------------------------------------------------------
-def make_row(source, category, title, company, location, link, extra="", remote=False):
+def clean_html(text, limit=3000):
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def make_row(source, category, title, company, location, link, extra="", remote=False, text=""):
     return {
         "Category": category, "Title": title, "Organization": company,
         "Location": location, "Remote": remote, "Details": extra,
-        "Link": link, "Source": source,
+        "Link": link, "Source": source, "Text": clean_html(text),
     }
 
 
@@ -137,6 +174,7 @@ def fetch_jobicy(keyword, internship=False):
         r.raise_for_status()
         for j in r.json().get("jobs", []):
             title = j.get("jobTitle", "")
+            body = j.get("jobDescription") or j.get("jobExcerpt") or ""
             blob = f"{title} {j.get('jobExcerpt','')} {as_text(j.get('jobLevel'))}"
             if internship and "intern" not in blob.lower():
                 continue
@@ -144,7 +182,7 @@ def fetch_jobicy(keyword, internship=False):
             rows.append(make_row(
                 "Jobicy", "Internships" if internship else "Jobs", title,
                 j.get("companyName", ""), geo, j.get("url", ""),
-                as_text(j.get("jobType")), remote=is_remote(geo)))
+                as_text(j.get("jobType")), remote=is_remote(geo), text=body))
     except Exception as e:
         st.warning(f"Jobicy failed: {e}")
     return rows
@@ -169,7 +207,8 @@ def fetch_remoteok(keyword, internship=False):
                 rows.append(make_row(
                     "Remote OK", "Internships" if internship else "Jobs",
                     j.get("position", ""), j.get("company", ""), loc,
-                    j.get("url", ""), as_text(j.get("tags")), remote=is_remote(loc)))
+                    j.get("url", ""), as_text(j.get("tags")), remote=is_remote(loc),
+                    text=f"{as_text(j.get('tags'))} {j.get('description','')}"))
     except Exception as e:
         st.warning(f"Remote OK failed: {e}")
     return rows
@@ -209,7 +248,7 @@ def fetch_wwr(keyword, internship=False):
                 loc = it["region"] or "Remote"
                 rows.append(make_row(
                     "We Work Remotely", "Internships" if internship else "Jobs",
-                    role, company, loc, it["link"], remote=is_remote(loc)))
+                    role, company, loc, it["link"], remote=is_remote(loc), text=it["desc"]))
         except Exception as e:
             st.warning(f"We Work Remotely feed failed: {e}")
     return rows
@@ -242,7 +281,7 @@ def fetch_muse(keyword, internship=False):
                     j.get("name", ""), (j.get("company") or {}).get("name", ""),
                     loc, (j.get("refs") or {}).get("landing_page", ""),
                     ", ".join(l.get("name", "") for l in j.get("levels", [])),
-                    remote=is_remote(loc)))
+                    remote=is_remote(loc), text=j.get("contents", "")))
     except Exception as e:
         st.warning(f"The Muse failed: {e}")
     return rows
@@ -296,14 +335,15 @@ def scrape_source(src, keyword, location):
             if title:
                 rows.append(make_row(src["name"], src["category"], title,
                                      text_of(card, src.get("company")), loc, href,
-                                     remote=is_remote(loc, title)))
+                                     remote=is_remote(loc, title),
+                                     text=card.get_text(" ", strip=True)))
     except Exception as e:
         st.warning(f"{src['name']} failed: {e}")
     return rows
 
 
 # ---------------------------------------------------------------------------
-# UI
+# Google search buttons (for sites that do not allow scraping)
 # ---------------------------------------------------------------------------
 GOOGLE_SITES = {
     "LinkedIn": "linkedin.com/jobs",
@@ -337,19 +377,276 @@ def google_links(keyword, location, internship, include_remote, freshness):
     loc = google_location_clause(location, include_remote)
     tbs = f"&tbs=qdr:{FRESHNESS[freshness]}" if FRESHNESS[freshness] else ""
     base = "https://www.google.com/search?q="
-    links = {
-        "Google Jobs": f"{base}{quote_plus(f'{keyword} {"internship" if internship else "jobs"} {location}'.strip())}&ibp=htl;jobs",
-    }
+    word = "internship" if internship else "jobs"
+    jobs_query = f"{keyword} {word} {location}".strip()
+    links = {"Google Jobs": f"{base}{quote_plus(jobs_query)}&ibp=htl;jobs"}
     for name, site in GOOGLE_SITES.items():
         query = " ".join(x for x in (f"site:{site}", role, loc) if x)
         links[name] = f"{base}{quote_plus(query)}{tbs}"
     return links
 
 
+# ---------------------------------------------------------------------------
+# CV matching (local, no AI key needed)
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def read_cv_file(name, data):
+    if name.lower().endswith(".pdf"):
+        try:
+            from io import BytesIO
+            from pypdf import PdfReader
+            return "\n".join((p.extract_text() or "") for p in PdfReader(BytesIO(data)).pages)
+        except Exception as e:
+            return f"__ERROR__ {e}"
+    return data.decode("utf-8", "ignore")
+
+
+def build_skill_regex(extra_skills):
+    extra = [s.strip().lower() for s in extra_skills.split(",") if s.strip()]
+    skills = sorted(set(SKILLS) | set(extra), key=len, reverse=True)
+    pattern = r"(?<![A-Za-z0-9])(" + "|".join(re.escape(s) for s in skills) + r")(?![A-Za-z0-9])"
+    return re.compile(pattern, re.I)
+
+
+def find_skills(rx, text):
+    return {m.lower() for m in rx.findall(text or "")}
+
+
+def add_cv_match(df, cv_text, extra_skills):
+    """Add 'Match %' and 'Matched skills' columns and sort best first."""
+    rx = build_skill_regex(extra_skills)
+    cv_skills = find_skills(rx, cv_text)
+    cv_lower = cv_text.lower()
+    pcts, shared = [], []
+    for _, r in df.iterrows():
+        job_text = f"{r['Title']} {r['Details']} {r['Text']}"
+        job_skills = find_skills(rx, job_text)
+        matched = job_skills & cv_skills
+        words = [w for w in re.findall(r"[a-z]{3,}", str(r["Title"]).lower()) if w not in STOPWORDS]
+        title_score = (sum(1 for w in words if w in cv_lower) / len(words)) if words else 0.0
+        if job_skills and cv_skills:
+            score = 0.7 * (len(matched) / len(job_skills)) + 0.3 * title_score
+        else:
+            score = title_score
+        pcts.append(round(100 * score))
+        shared.append(", ".join(sorted(matched)))
+    df = df.copy()
+    df["Match %"] = pcts
+    df["Matched skills"] = shared
+    return df.sort_values("Match %", ascending=False).reset_index(drop=True), cv_skills
+
+
+# ---------------------------------------------------------------------------
+# Tracker (kept in your browser session, never on the server)
+# ---------------------------------------------------------------------------
+def empty_tracker():
+    df = pd.DataFrame({c: pd.Series(dtype="object") for c in TRACK_COLS})
+    df["Deadline"] = pd.to_datetime(df["Deadline"])
+    return df
+
+
+def add_to_tracker(rows):
+    t = st.session_state["tracker"]
+    existing = set(t["Link"].dropna())
+    new = []
+    for _, r in rows.iterrows():
+        if r["Link"] in existing:
+            continue
+        new.append({
+            "Title": r["Title"], "Organization": r["Organization"], "Status": "Saved",
+            "Deadline": pd.NaT, "Notes": "", "Location": r["Location"], "Source": r["Source"],
+            "Match %": r.get("Match %"), "Link": r["Link"],
+        })
+    if new:
+        t = pd.concat([t, pd.DataFrame(new)], ignore_index=True)
+        t["Deadline"] = pd.to_datetime(t["Deadline"], errors="coerce")
+        st.session_state["tracker"] = t
+        st.session_state["tracker_ver"] += 1
+    return len(new)
+
+
+def apply_tracker_edits(key):
+    """Callback: merge the editor's changes into the stored tracker."""
+    state = st.session_state.get(key, {})
+    df = st.session_state["tracker"].copy().reset_index(drop=True)
+    for idx, changes in state.get("edited_rows", {}).items():
+        for col, val in changes.items():
+            if col == "Deadline":
+                val = pd.to_datetime(val, errors="coerce")
+            df.at[int(idx), col] = val
+    if state.get("deleted_rows"):
+        df = df.drop(index=state["deleted_rows"])
+    added = []
+    for row in state.get("added_rows", []):
+        new = {c: None for c in TRACK_COLS}
+        new["Status"] = "Saved"
+        new.update(row)
+        added.append(new)
+    if added:
+        df = pd.concat([df, pd.DataFrame(added)], ignore_index=True)
+    df["Deadline"] = pd.to_datetime(df["Deadline"], errors="coerce")
+    st.session_state["tracker"] = df.reset_index(drop=True)
+    st.session_state["tracker_ver"] += 1
+
+
+def render_tracker():
+    t = st.session_state["tracker"].copy()
+    t["Deadline"] = pd.to_datetime(t["Deadline"], errors="coerce")
+    st.subheader("📋 My applications")
+    st.caption("Saved only in this browser session. Download the CSV to keep it, "
+               "and restore it below next time.")
+
+    # Deadline reminders
+    open_rows = t[t["Deadline"].notna() & ~t["Status"].isin(["Offer", "Rejected"])]
+    if not open_rows.empty:
+        days = (open_rows["Deadline"] - pd.Timestamp.today().normalize()).dt.days
+        for _, r in open_rows[days < 0].iterrows():
+            st.error(f"⏰ Deadline passed: {r['Title']} ({r['Organization']})")
+        for (_, r), d in zip(open_rows[(days >= 0) & (days <= 7)].iterrows(), days[(days >= 0) & (days <= 7)]):
+            st.warning(f"⏰ {d} day(s) left: {r['Title']} ({r['Organization']})")
+
+    if t.empty:
+        st.info("Nothing saved yet. Tick **Save** next to a result and press "
+                "**Add selected to tracker**.")
+    else:
+        key = f"tracker_editor_{st.session_state['tracker_ver']}"
+        st.data_editor(
+            t[TRACK_COLS], key=key, num_rows="dynamic", hide_index=True,
+            use_container_width=True, on_change=apply_tracker_edits, args=(key,),
+            disabled=["Source", "Match %", "Link"],
+            column_config={
+                "Status": st.column_config.SelectboxColumn("Status", options=STATUSES, required=True),
+                "Deadline": st.column_config.DateColumn("Deadline", format="DD MMM YYYY"),
+                "Link": st.column_config.LinkColumn("Link", display_text="Open"),
+                "Match %": st.column_config.NumberColumn("Match %", format="%d%%"),
+            },
+        )
+        counts = t["Status"].value_counts()
+        st.caption(" · ".join(f"{s}: {int(counts.get(s, 0))}" for s in STATUSES))
+        st.download_button("⬇️ Download tracker (CSV)", t[TRACK_COLS].to_csv(index=False).encode("utf-8"),
+                           file_name="my_applications.csv", mime="text/csv")
+
+    up = st.file_uploader("Restore a saved tracker (CSV)", type="csv", key="tracker_upload")
+    if up is not None:
+        sig = f"{up.name}-{up.size}"
+        if st.session_state.get("tracker_loaded") != sig:
+            try:
+                df = pd.read_csv(up)
+                for c in TRACK_COLS:
+                    if c not in df.columns:
+                        df[c] = None
+                df = df[TRACK_COLS]
+                df["Deadline"] = pd.to_datetime(df["Deadline"], errors="coerce")
+                df["Notes"] = df["Notes"].fillna("")
+                st.session_state["tracker"] = df
+                st.session_state["tracker_ver"] += 1
+                st.session_state["tracker_loaded"] = sig
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not read that file: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Search tab
+# ---------------------------------------------------------------------------
+def run_search(p):
+    keyword, internship = p["keyword"], p["category"] == "Internships"
+    loc_terms = expand_location(p["location"])
+    rows = []
+    with st.spinner("Searching sources..."):
+        for name in p["chosen"]:
+            rows += API_SOURCES[name](keyword, internship)
+        for src in p["custom"]:
+            rows += scrape_source(src, f"{keyword} intern" if internship else keyword, p["location"])
+
+    st.session_state["res_ver"] += 1
+    if not rows:
+        st.session_state["results"] = {"query": p, "df": pd.DataFrame(), "total": 0, "terms": loc_terms}
+        return
+    df = pd.DataFrame(rows).drop_duplicates(subset=["Title", "Organization", "Link"])
+    total = len(df)
+    df = apply_location_filter(df, loc_terms, p["include_remote"], p["include_unknown"]).reset_index(drop=True)
+    st.session_state["results"] = {"query": p, "df": df, "total": total, "terms": loc_terms}
+
+
+def render_results(cv_text, extra_skills):
+    res = st.session_state.get("results")
+    if res is None:
+        st.info("Enter a keyword in the sidebar and press **Search**.")
+        return
+    p, df = res["query"], res["df"]
+    internship = p["category"] == "Internships"
+
+    with st.expander("🔍 Find exact jobs with Google (sites that don't allow scraping)", expanded=True):
+        st.caption("Each button opens a Google search limited to one job site, using your "
+                   "keyword, location and date filter.")
+        cols = st.columns(3)
+        links = google_links(p["keyword"], p["location"], internship, p["include_remote"], p["freshness"])
+        for i, (name, url) in enumerate(links.items()):
+            cols[i % 3].link_button(name, url, use_container_width=True)
+
+    if df.empty:
+        if res["total"]:
+            st.warning("Nothing matched this location. Try a country name, tick "
+                       "'include remote', or tick 'include listings with no location'.")
+        else:
+            st.warning("No results from the job sources. Try another keyword, or use the Google buttons above.")
+        return
+
+    if res["terms"]:
+        st.caption(f"Location terms used: {', '.join(res['terms'])} · "
+                   f"{len(df)} of {res['total']} results match")
+
+    cols_show = ["Save", "Title", "Organization", "Location", "Remote", "Source", "Link"]
+    if cv_text.strip():
+        df, cv_skills = add_cv_match(df, cv_text, extra_skills)
+        cols_show = ["Save", "Match %", "Matched skills"] + cols_show[1:]
+        st.caption("CV skills detected: " + (", ".join(sorted(cv_skills)) or
+                   "none (matching on title words only; add skills in the sidebar)"))
+
+    view = df.copy()
+    view.insert(0, "Save", False)
+    st.success(f"Found {len(df)} results")
+    edited = st.data_editor(
+        view[cols_show], key=f"res_editor_{st.session_state['res_ver']}", hide_index=True,
+        use_container_width=True, disabled=[c for c in cols_show if c != "Save"],
+        column_config={
+            "Save": st.column_config.CheckboxColumn("Save"),
+            "Match %": st.column_config.ProgressColumn("Match %", min_value=0, max_value=100, format="%d%%"),
+            "Link": st.column_config.LinkColumn("Link", display_text="Open"),
+        },
+    )
+    c1, c2 = st.columns([1, 1])
+    if c1.button("➕ Add selected to tracker"):
+        chosen = df.loc[edited.index[edited["Save"]]]
+        if chosen.empty:
+            st.toast("Tick Save next to at least one result first.")
+        else:
+            n = add_to_tracker(chosen)
+            st.session_state["res_ver"] += 1
+            st.toast(f"Added {n} to your tracker.")
+            st.rerun()
+    c2.download_button("⬇️ Download results (CSV)",
+                       df.drop(columns=["Text"]).to_csv(index=False).encode("utf-8"),
+                       file_name=f"{p['category'].lower()}_{p['keyword'].replace(' ', '_')}.csv",
+                       mime="text/csv")
+    st.caption("Listings provided by [Jobicy](https://jobicy.com), "
+               "[Remote OK](https://remoteok.com), "
+               "[We Work Remotely](https://weworkremotely.com) and "
+               "[The Muse](https://www.themuse.com).")
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Opportunity Finder", page_icon="🔎", layout="wide")
+    st.session_state.setdefault("tracker", empty_tracker())
+    st.session_state.setdefault("tracker_ver", 0)
+    st.session_state.setdefault("res_ver", 0)
+
     st.title("🔎 Opportunity Finder")
-    st.caption("Jobs and internships from multiple sources.")
+    st.caption("Jobs and internships from multiple sources, matched to your CV and tracked in one place.")
 
     with st.sidebar:
         st.header("Search")
@@ -361,66 +658,42 @@ def main():
         location = st.text_input("Where?", placeholder="e.g. Rawalpindi, Pakistan")
         include_remote = st.checkbox("Also include remote / worldwide", value=True)
         include_unknown = st.checkbox("Also include listings with no location", value=False)
-
         freshness = st.selectbox("Google links: posted within", list(FRESHNESS), index=2)
+
+        with st.expander("📄 CV matching (optional)"):
+            cv_file = st.file_uploader("Upload CV (PDF or TXT)", type=["pdf", "txt"])
+            cv_paste = st.text_area("...or paste your CV text", height=120)
+            extra_skills = st.text_input("Extra skills to look for", placeholder="comma separated")
+            st.caption("Your CV is read in memory for this session only and is not saved.")
 
         enabled_custom = [s for s in SOURCES if s["enabled"]]
         go = st.button("Search", type="primary", use_container_width=True)
 
-    if not go:
-        st.info("Enter a keyword and press **Search**.")
-        return
-    if not keyword.strip():
-        st.error("Please enter a keyword.")
-        return
+    cv_text = cv_paste or ""
+    if cv_file is not None:
+        text = read_cv_file(cv_file.name, cv_file.getvalue())
+        if text.startswith("__ERROR__"):
+            st.sidebar.warning("Could not read that PDF (is pypdf installed?). Paste the text instead.")
+        else:
+            cv_text = f"{cv_text}\n{text}"
 
-    internship = category == "Internships"
+    tab_search, tab_tracker = st.tabs(["🔎 Search", "📋 My tracker"])
 
-    with st.expander("🔍 Find exact jobs with Google (sites that don't allow scraping)", expanded=True):
-        st.caption("Each button opens a Google search limited to one job site, using your "
-                   "keyword, location and date filter.")
-        cols = st.columns(3)
-        links = google_links(keyword, location, internship, include_remote, freshness)
-        for i, (name, url) in enumerate(links.items()):
-            cols[i % 3].link_button(name, url, use_container_width=True)
+    with tab_search:
+        if go:
+            if not keyword.strip():
+                st.error("Please enter a keyword.")
+            else:
+                run_search({
+                    "keyword": keyword.strip(), "category": category, "chosen": chosen,
+                    "location": location, "include_remote": include_remote,
+                    "include_unknown": include_unknown, "freshness": freshness,
+                    "custom": enabled_custom,
+                })
+        render_results(cv_text, extra_skills)
 
-    queries = [keyword]
-    loc_terms = expand_location(location)
-
-    rows = []
-    with st.spinner("Searching sources..."):
-        for q in queries:
-            for name in chosen:
-                rows += API_SOURCES[name](q, internship)
-            for src in enabled_custom:
-                rows += scrape_source(src, f"{q} intern" if internship else q, location)
-
-    if not rows:
-        st.warning("No results. Try another keyword or enable more sources.")
-        return
-
-    df = pd.DataFrame(rows).drop_duplicates(subset=["Title", "Organization", "Link"])
-    total = len(df)
-    df = apply_location_filter(df, loc_terms, include_remote, include_unknown).reset_index(drop=True)
-
-    if loc_terms:
-        st.caption(f"Location terms used: {', '.join(loc_terms)} · "
-                   f"{len(df)} of {total} results match")
-    if df.empty:
-        st.warning("Nothing matched this location. Try a country name, tick "
-                   "'include remote', or tick 'include listings with no location'.")
-        return
-
-    st.success(f"Found {len(df)} results")
-    st.dataframe(df, use_container_width=True, hide_index=True,
-                 column_config={"Link": st.column_config.LinkColumn("Link", display_text="Open")})
-    st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode("utf-8"),
-                       file_name=f"{category.lower()}_{keyword.replace(' ', '_')}.csv",
-                       mime="text/csv")
-    st.caption("Listings provided by [Jobicy](https://jobicy.com), "
-               "[Remote OK](https://remoteok.com), "
-               "[We Work Remotely](https://weworkremotely.com) and "
-               "[The Muse](https://www.themuse.com).")
+    with tab_tracker:
+        render_tracker()
 
 
 if __name__ == "__main__":
